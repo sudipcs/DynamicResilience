@@ -1,0 +1,810 @@
+---
+title: "seahorse"
+output: html_document
+date: "2025-10-23"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+Seahorse assay data with both longitudinal (timepoints) and case/control (Treatment) design, meaning this is a repeated measures + group comparison problem.
+
+
+i have seahorse from differen patients so need to
+read file sd.xlsx file then column Patient ID, 	Timepoint has 4 different point Base,Day1,Day30,Day90 and Treatment has control vs stim and other all features. so here i have case vs control and longitudinal data both so how should i proceed here
+
+Goal:
+Want to test whether Seahorse features (like OCR, ECAR, etc.) change:
+Over time (Base → Day1 → Day30 → Day90) → longitudinal effect
+Between Treatment groups (Control vs Stim) → case/control effect
+Possibly, whether the time trends differ by Treatment → interaction effect
+
+
+
+
+
+```{r}
+# Load required packages
+library(readxl)
+library(dplyr)
+library(readr)
+library(tidyr)
+library(lme4)
+library(lmerTest)
+library(ggplot2)
+library(janitor)
+library(broom.mixed)
+library(openxlsx)
+library(rstatix)
+library(gt)
+
+
+# Read the data
+df <- read_excel("Seahorse results 13-10-25.xlsx")  %>%
+  janitor::clean_names()  # just clean names first
+
+df <- df %>%
+  mutate(
+    patient_id = as.factor(patient_id),
+    timepoint = factor(timepoint, levels = c("Base", "Day1", "Day30", "Day90")),
+    treatment = factor(treatment, levels = c("control", "stim"))
+  )
+
+# Check the structure
+#str(df)
+
+colnames(df)
+
+
+```
+
+```{r}
+
+library(rstatix)
+library(gt)
+
+# Identify numeric Seahorse variables
+num_vars <- df %>% select(where(is.numeric)) %>% colnames()
+
+# Summary stats: mean and sd by timepoint × treatment
+summary_stats <- df %>%
+  group_by(timepoint, treatment) %>%
+  summarise(across(all_of(num_vars),
+                   list(mean = ~mean(., na.rm = TRUE),
+                        sd   = ~sd(., na.rm = TRUE)),
+                   .names = "{.col}__{.fn}"),
+            .groups = "drop")
+
+# Compute p-values per timepoint
+pvals <- df %>%
+  pivot_longer(cols = all_of(num_vars), names_to = "variable", values_to = "value") %>%
+  group_by(timepoint, variable) %>%
+  t_test(value ~ treatment) %>%
+  select(timepoint, variable, p)
+
+# Reshape table cleanly
+summary_long <- summary_stats %>%
+  pivot_longer(
+    -c(timepoint, treatment),
+    names_to = c("variable", "stat"),
+    names_sep = "__"   # <-- double underscore avoids splitting variable names
+  ) %>%
+  pivot_wider(
+    names_from = c(treatment, stat),
+    values_from = value,
+    values_fn = mean   # <-- handle duplicates automatically
+  ) %>%
+  left_join(pvals, by = c("timepoint", "variable")) %>%
+  mutate(
+    control_summary = sprintf("%.2f ± %.2f", control_mean, control_sd),
+    stim_summary    = sprintf("%.2f ± %.2f", stim_mean, stim_sd),
+    p = signif(p, 3)
+  ) %>%
+  select(timepoint, variable, control_summary, stim_summary, p)
+
+# Display
+summary_long %>%
+  arrange(variable, timepoint) %>%
+  gt(groupname_col = "variable") %>%
+  fmt_number(columns = "p", decimals = 3) %>%
+  tab_header(
+    title = "Seahorse Assay Summary by Timepoint and Treatment",
+    subtitle = "Mean ± SD with p-values (Control vs Stim)"
+  )
+
+
+```
+
+
+
+
+#  new updated version
+```{r}
+
+
+# Identify numeric Seahorse features
+num_vars <- df %>% select(where(is.numeric)) %>% colnames()
+
+# --- Summary and p-values ---
+summary_stats <- df %>%
+  group_by(timepoint, treatment) %>%
+  summarise(across(all_of(num_vars),
+                   list(mean = ~mean(., na.rm = TRUE),
+                        sd   = ~sd(., na.rm = TRUE)),
+                   .names = "{.col}__{.fn}"),
+            .groups = "drop")
+
+pvals <- df %>%
+  pivot_longer(cols = all_of(num_vars), names_to = "variable", values_to = "value") %>%
+  group_by(timepoint, variable) %>%
+  t_test(value ~ treatment) %>%
+  select(timepoint, variable, p)
+
+# --- Combine summaries ---
+summary_long <- summary_stats %>%
+  pivot_longer(
+    -c(timepoint, treatment),
+    names_to = c("variable", "stat"),
+    names_sep = "__"
+  ) %>%
+  pivot_wider(
+    names_from = c(treatment, stat),
+    values_from = value,
+    values_fn = mean
+  ) %>%
+  left_join(pvals, by = c("timepoint", "variable")) %>%
+  mutate(
+    control_summary = sprintf("%.2f ± %.2f", control_mean, control_sd),
+    stim_summary    = sprintf("%.2f ± %.2f", stim_mean, stim_sd),
+    cell = sprintf("%s | %s (p=%.3f)", control_summary, stim_summary, p)
+  ) %>%
+  select(variable, timepoint, cell)
+
+# --- Reshape so columns = timepoints ---
+summary_wide <- summary_long %>%
+  pivot_wider(names_from = timepoint, values_from = cell)
+
+# --- Display nicely ---
+summary_wide %>%
+  gt() %>%
+  tab_header(
+    title = "Seahorse Assay Summary",
+    subtitle = "Control vs Stim (Mean ± SD | p-value) across Timepoints"
+  ) %>%
+  cols_label(
+    variable = "Feature",
+    Base = "Base",
+    Day1 = "Day 1",
+    Day30 = "Day 30",
+    Day90 = "Day 90"
+  ) %>%
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_column_labels(everything())
+  )
+
+
+```
+
+
+
+```{r}
+library(dplyr)
+library(stringr)
+library(gt)
+library(webshot)
+
+# --- Extract numeric p-values for each timepoint ---
+summary_wide <- summary_wide %>%
+  mutate(
+    p_Base  = as.numeric(str_extract(Base, "(?<=\\(p=)[0-9\\.]+(?=\\))")),
+    p_Day1  = as.numeric(str_extract(Day1, "(?<=\\(p=)[0-9\\.]+(?=\\))")),
+    p_Day30 = as.numeric(str_extract(Day30, "(?<=\\(p=)[0-9\\.]+(?=\\))")),
+    p_Day90 = as.numeric(str_extract(Day90, "(?<=\\(p=)[0-9\\.]+(?=\\))"))
+  )
+
+# --- Build gt table with per-cell highlight for p < 0.05 ---
+gt_table <- summary_wide %>%
+  gt() %>%
+  tab_header(
+    title = "Seahorse Assay Summary",
+    subtitle = "Control vs Stim (Mean ± SD | p-value) across Timepoints"
+  ) %>%
+  cols_label(
+    variable = "Feature",
+    Base = "Base",
+    Day1 = "Day 1",
+    Day30 = "Day 30",
+    Day90 = "Day 90"
+  ) %>%
+  tab_style(
+    style = list(cell_text(weight = "bold")),
+    locations = cells_column_labels(everything())
+  ) %>%
+  # Highlight significant cells
+  tab_style(
+    style = list(cell_fill(color = "#FFEBEE"), cell_text(weight = "bold", color = "#B71C1C")),
+    locations = cells_body(columns = Base, rows = p_Base < 0.05)
+  ) %>%
+  tab_style(
+    style = list(cell_fill(color = "#FFEBEE"), cell_text(weight = "bold", color = "#B71C1C")),
+    locations = cells_body(columns = Day1, rows = p_Day1 < 0.05)
+  ) %>%
+  tab_style(
+    style = list(cell_fill(color = "#FFEBEE"), cell_text(weight = "bold", color = "#B71C1C")),
+    locations = cells_body(columns = Day30, rows = p_Day30 < 0.05)
+  ) %>%
+  tab_style(
+    style = list(cell_fill(color = "#FFEBEE"), cell_text(weight = "bold", color = "#B71C1C")),
+    locations = cells_body(columns = Day90, rows = p_Day90 < 0.05)
+  )
+
+# --- Save as HTML ---
+gtsave(gt_table, "run2/Seahorse_Sigsummary_table.html")
+
+
+
+```
+
+
+
+#  heatmap
+
+```{r}
+
+library(stringr)
+
+# --- Create significance flag for each cell (Base, Day1, Day30, Day90) ---
+sig_long <- summary_wide %>%
+  mutate(
+    sig_Base  = ifelse(p_Base  < 0.05, "p<0.05", "p≥0.05"),
+    sig_Day1  = ifelse(p_Day1  < 0.05, "p<0.05", "p≥0.05"),
+    sig_Day30 = ifelse(p_Day30 < 0.05, "p<0.05", "p≥0.05"),
+    sig_Day90 = ifelse(p_Day90 < 0.05, "p<0.05", "p≥0.05")
+  ) %>%
+  select(variable, sig_Base, sig_Day1, sig_Day30, sig_Day90) %>%
+  pivot_longer(
+    cols = starts_with("sig_"),
+    names_to = "timepoint",
+    names_prefix = "sig_",
+    values_to = "significance"
+  )
+
+# --- Filter only significant features (any timepoint p < 0.05) ---
+sig_features <- summary_wide %>%
+  filter(p_Base < 0.05 | p_Day1 < 0.05 | p_Day30 < 0.05 | p_Day90 < 0.05) %>%
+  pull(variable)
+
+print(sig_features)
+
+heatmap_data <- sig_long %>%
+  filter(variable %in% sig_features)
+
+# --- Plot clean significance heatmap ---
+ggplot(heatmap_data, aes(x = timepoint, y = variable, fill = significance)) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  scale_fill_manual(
+    values = c("p<0.05" = "#E53935", "p≥0.05" = "#E0E0E0"),
+    name = "Significance"
+  ) +
+  labs(
+    title = "Seahorse Assay: Significant Features Heatmap",
+    x = "Timepoint",
+    y = "Feature"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 10),
+    panel.grid = element_blank()
+  )
+
+# ggsave("run2/Seahorse_significant_heatmap.png", width = 8, height = 6, dpi = 300)
+
+
+```
+
+# final PCA
+```{r}
+
+library(ggplot2)
+library(ggforce)
+library(dplyr)
+library(readxl)
+library(janitor)
+
+
+# ---- Select numeric Seahorse features ----
+num_vars <- df %>% select(where(is.numeric)) %>% colnames()
+
+# ---- PCA ----
+pca <- prcomp(df[, num_vars], center = TRUE, scale. = TRUE)
+pca_scores <- as.data.frame(pca$x[, 1:2]) %>%
+  bind_cols(df %>% select(patient_id, treatment, timepoint))
+
+expl_var <- round((pca$sdev)^2 / sum(pca$sdev^2) * 100, 1)
+
+# ---- Create spacing by timepoint ----
+# Assign a numeric offset to each timepoint (for horizontal spacing)
+time_offsets <- c("Base" = 0, "Day1" = 10, "Day30" = 20, "Day90" = 30)
+pca_scores <- pca_scores %>%
+  mutate(PC1_shifted = PC1 + time_offsets[timepoint])
+
+# ---- PCA Plot with spaced clusters ----
+p_pca <- ggplot(pca_scores, aes(x = PC1_shifted, y = PC2,
+                                color = treatment,
+                                shape = timepoint)) +
+  geom_point(size = 4.2, alpha = 0.9, stroke = 1.1) +
+  geom_mark_ellipse(aes(fill = treatment),
+                    color = NA, alpha = 0.12, expand = unit(3, "mm")) +
+  scale_color_manual(values = c("control" = "#1E88E5", "stim" = "#E53935")) +
+  scale_fill_manual(values = c("control" = "#1E88E5", "stim" = "#E53935")) +
+  scale_shape_manual(values = c(16, 17, 15, 18)) +
+  labs(
+    title = "PCA Score Plot – Seahorse Data (Control vs Stim)",
+    subtitle = "All Timepoints (Base → Day1 → Day30 → Day90)",
+    x = paste0("PC1 (shifted by timepoint, ", expl_var[1], "% variance)"),
+    y = paste0("PC2 (", expl_var[2], "% variance)"),
+    color = "Treatment",
+    shape = "Timepoint"
+  ) +
+  theme_minimal(base_size = 16) +
+  theme(
+    plot.title = element_text(face = "bold", size = 20, hjust = 0.5),
+    plot.subtitle = element_text(size = 14, hjust = 0.5, color = "gray30"),
+    axis.title = element_text(face = "bold", size = 14),
+    axis.text = element_text(size = 12),
+    legend.title = element_text(face = "bold", size = 13),
+    legend.text = element_text(size = 12),
+    legend.position = "right",
+    panel.grid = element_blank(),
+    plot.margin = margin(20, 20, 20, 20)
+  ) +
+  annotate("text",
+           x = c(0, 10, 20, 30),
+           y = max(pca_scores$PC2) * 1.05,
+           label = c("Base", "Day1", "Day30", "Day90"),
+           size = 5,
+           fontface = "bold",
+           color = "gray20")
+
+# ---- Save high-resolution PNG ----
+ggsave(
+  filename = "run2/Seahorse_PCA_AllTimepoints_Spaced.png",
+  plot = p_pca,
+  width = 12,
+  height = 8,
+  dpi = 600,
+  bg = "white"
+)
+
+# ---- Show plot ----
+p_pca
+
+
+```
+
+# PCA v2
+
+```{r}
+
+# ---- PCA Plot with spaced clusters ----
+p_pca <- ggplot(pca_scores, aes(x = PC1_shifted, y = PC2,
+                                color = treatment,
+                                shape = timepoint)) +
+  geom_point(size = 4.2, alpha = 0.9, stroke = 1.1) +
+  geom_mark_ellipse(aes(fill = treatment),
+                    color = NA, alpha = 0.12, expand = unit(3, "mm"),
+                    show.legend = FALSE) +
+  scale_color_manual(values = c("control" = "#1E88E5", "stim" = "#E53935")) +
+  scale_fill_manual(values = c("control" = "#1E88E5", "stim" = "#E53935")) +
+  scale_shape_manual(values = c(16, 17, 15, 18)) +
+  labs(
+    title = "PCA Score Plot – Seahorse Data (Control vs Stim)",
+    subtitle = "All Timepoints (Base → Day1 → Day30 → Day90)",
+    x = paste0("PC1 ( ", expl_var[1], "% variance)"),
+    y = paste0("PC2 (", expl_var[2], "% variance)"),
+    color = "Treatment",
+    shape = "Timepoint"
+  ) +
+  theme_minimal(base_size = 16) +
+  theme(
+    plot.title = element_text(face = "bold", size = 20, hjust = 0.5),
+    plot.subtitle = element_text(size = 14, hjust = 0.5, color = "gray30"),
+    axis.title.x = element_text(face = "bold", size = 14),   # Bold axis title (X)
+    axis.title.y = element_text(face = "bold", size = 14),   # Bold axis title (Y)
+    axis.text = element_text(size = 12, face = "bold"),      # Bold axis tick labels
+    axis.line = element_line(linewidth = 1.2, colour = "black"),  # Add bold axis lines
+    legend.title = element_text(face = "bold", size = 13),
+    legend.text = element_text(size = 12),
+    legend.position = "right",
+    panel.grid = element_blank(),
+    plot.margin = margin(20, 20, 20, 20)
+  ) +
+  annotate("text",
+           x = c(0, 10, 20, 30),
+           y = max(pca_scores$PC2) * 1.05,
+           label = c("Base", "Day1", "Day30", "Day90"),
+           size = 5,
+           fontface = "bold",
+           color = "gray20")
+
+
+
+# ---- Save high-resolution PNG ----
+ggsave(
+  filename = "run2/new2Seahorse_PCA_AllTimepoints_Spaced.png",
+  plot = p_pca,
+  width = 12,
+  height = 8,
+  dpi = 600,
+  bg = "white"
+)
+
+# ---- Show plot ----
+p_pca
+
+
+
+```
+
+# Seahorse Heatmap Across Timepoints (Common Patients)
+
+```{r}
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(pheatmap)
+library(janitor)
+library(ggplot2)
+library(tibble)
+
+# ---- Read and clean data ----
+df <- read_excel("Seahorse results 13-10-25.xlsx") %>%
+  clean_names() %>%
+  mutate(
+    patient_id = as.factor(patient_id),
+    timepoint = factor(timepoint, levels = c("Base", "Day1", "Day30", "Day90"))
+  )
+
+# ---- Identify numeric Seahorse features ----
+num_vars <- df %>% select(where(is.numeric)) %>% colnames()
+
+# ---- Keep only patients present at all 4 timepoints ----
+common_ids <- df %>%
+  group_by(patient_id) %>%
+  summarise(n_tp = n_distinct(timepoint), .groups = "drop") %>%
+  filter(n_tp == 4) %>%
+  pull(patient_id)
+
+df_common <- df %>% filter(patient_id %in% common_ids)
+
+# ---- Average if duplicate per patient/timepoint (optional) ----
+df_avg <- df_common %>%
+  group_by(patient_id, timepoint) %>%
+  summarise(across(all_of(num_vars), mean, na.rm = TRUE), .groups = "drop")
+
+# ---- Standardize features (z-score) ----
+df_scaled <- df_avg %>%
+  mutate(across(all_of(num_vars), scale))
+
+# ---- Reshape data: rows = timepoints, columns = patients ----
+# If you want to visualize one feature at a time, choose it here
+feature_of_interest <- num_vars[1]   # change to your desired Seahorse feature
+heat_data <- df_scaled %>%
+  select(patient_id, timepoint, all_of(feature_of_interest)) %>%
+  pivot_wider(names_from = patient_id, values_from = all_of(feature_of_interest)) %>%
+  tibble::column_to_rownames("timepoint")
+
+# ---- Generate heatmap ----
+pheatmap(
+  mat = as.matrix(heat_data),
+  cluster_rows = FALSE,
+  cluster_cols = TRUE,
+  color = colorRampPalette(c("#2166AC", "white", "#B2182B"))(100),
+  main = paste("Heatmap for", feature_of_interest, "(Common Patients)"),
+  fontsize_row = 12,
+  fontsize_col = 10,
+  angle_col = 45,
+  border_color = NA
+)
+
+# ---- Save high-resolution PNG ----
+png(paste0("Heatmap_", feature_of_interest, "_CommonPatients.png"),
+    width = 1800, height = 1200, res = 300)
+pheatmap(
+  mat = as.matrix(heat_data),
+  cluster_rows = FALSE,
+  cluster_cols = TRUE,
+  color = colorRampPalette(c("#2166AC", "white", "#B2182B"))(100),
+  main = paste("Heatmap for", feature_of_interest, "(Common Patients)"),
+  fontsize_row = 12,
+  fontsize_col = 10,
+  angle_col = 45,
+  border_color = NA
+)
+dev.off()
+
+
+```
+
+
+
+
+```{r}
+for (f in num_vars) {
+  heat_data <- df_scaled %>%
+    select(patient_id, timepoint, all_of(f)) %>%
+    pivot_wider(names_from = patient_id, values_from = all_of(f)) %>%
+    tibble::column_to_rownames("timepoint")
+
+  png(paste0("Heatmap_", f, "_CommonPatients.png"),
+      width = 1800, height = 1200, res = 300)
+  pheatmap(
+    mat = as.matrix(heat_data),
+    cluster_rows = FALSE,
+    cluster_cols = TRUE,
+    color = colorRampPalette(c("#2166AC", "white", "#B2182B"))(100),
+    main = paste("Heatmap for", f, "(Common Patients)"),
+    fontsize_row = 12,
+    fontsize_col = 10,
+    angle_col = 45,
+    border_color = NA
+  )
+  dev.off()
+}
+
+```
+
+
+
+# Standard ANOVA (patient_id included in output)
+```{r}
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(broom)
+library(janitor)
+
+# ---- Read and prepare data ----
+df <- read_excel("Seahorse results 13-10-25.xlsx") %>%
+  clean_names() %>%
+  mutate(
+    patient_id = as.factor(patient_id),
+    timepoint = factor(timepoint, levels = c("Base", "Day1", "Day30", "Day90")),
+    treatment = factor(treatment, levels = c("control", "stim"))
+  )
+
+# ---- Identify numeric Seahorse features ----
+num_vars <- df %>% select(where(is.numeric)) %>% colnames()
+
+# ---- ANOVA test for each numeric feature ----
+anova_results <- lapply(num_vars, function(var) {
+  formula <- as.formula(paste(var, "~ treatment * timepoint"))
+  fit <- aov(formula, data = df)
+  res <- broom::tidy(fit) %>%
+    mutate(feature = var)
+  return(res)
+}) %>% bind_rows()
+
+# ---- Add patient-level summary (mean per patient per feature) ----
+patient_summary <- df %>%
+  select(patient_id, timepoint, treatment, all_of(num_vars)) %>%
+  pivot_longer(cols = all_of(num_vars), names_to = "feature", values_to = "value")
+
+# ---- Combine with ANOVA p-values ----
+anova_summary <- anova_results %>%
+  filter(term %in% c("treatment", "timepoint", "treatment:timepoint")) %>%
+  select(feature, term, p.value) %>%
+  left_join(patient_summary, by = "feature") %>%
+  arrange(feature, patient_id)
+
+# ---- Identify significant features ----
+signif_features <- anova_summary %>%
+  filter(p.value < 0.05) %>%
+  arrange(p.value)
+
+# ---- Save ----
+write.csv(anova_summary, "run2/ANOVA_summary_with_patients.csv", row.names = FALSE)
+write.csv(signif_features, "run2/ANOVA_significant_features_with_patients.csv", row.names = FALSE)
+
+cat("ANOVA results saved with patient_id included.\n")
+
+```
+
+```{r}
+
+```
+
+
+```{r}
+library(ggrepel)
+
+# Compute mean difference between treatments (Stim - Control)
+mean_diff <- df %>%
+  group_by(treatment) %>%
+  summarise(across(where(is.numeric), mean, na.rm = TRUE)) %>%
+  pivot_longer(-treatment, names_to = "feature", values_to = "mean_value") %>%
+  pivot_wider(names_from = treatment, values_from = mean_value) %>%
+  mutate(estimate = stim - control)
+
+# Combine mean difference with p-values
+volcano_df <- anova_results %>%
+  filter(term == "treatment") %>%
+  select(feature, p.value) %>%
+  left_join(mean_diff, by = "feature") %>%
+  mutate(
+    neg_log_p = -log10(p.value),
+    signif = ifelse(p.value < 0.05, "Significant", "NS")
+  )
+
+
+ggplot(volcano_df, aes(x = estimate, y = neg_log_p, color = signif, label = feature)) +
+  geom_point(size = 3) +
+  geom_text_repel(data = subset(volcano_df, p.value < 0.01), size = 3, max.overlaps = 20) +
+  scale_color_manual(values = c("Significant" = "red", "NS" = "gray")) +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "Volcano Plot – Treatment Effect (ANOVA)",
+    x = "Effect Size (Mean Difference)",
+    y = "-log10(p-value)"
+  )
+
+
+library(pheatmap)
+library(tidyr)
+
+# Average across patients for each feature × treatment × timepoint
+heat_data <- df %>%
+  group_by(timepoint, treatment) %>%
+  summarise(across(all_of(num_vars), mean, na.rm = TRUE)) %>%
+  pivot_longer(-c(timepoint, treatment), names_to = "feature", values_to = "mean_value") %>%
+  filter(feature %in% unique(signif_features$feature)) %>%
+  unite("group", treatment, timepoint, sep = "_") %>%
+  pivot_wider(names_from = group, values_from = mean_value)
+
+# Convert to matrix
+heat_mat <- as.data.frame(heat_data)
+rownames(heat_mat) <- heat_mat$feature
+heat_mat <- as.matrix(heat_mat[ , -1])
+
+# Plot heatmap
+pheatmap(
+  heat_mat,
+  cluster_rows = TRUE,
+  cluster_cols = TRUE,
+  color = colorRampPalette(c("navy", "white", "firebrick3"))(50),
+  main = "Mean Seahorse Features (Significant from ANOVA)",
+  fontsize_row = 10,
+  angle_col = 45,
+  border_color = NA
+)
+
+
+```
+
+
+# 
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(pheatmap)
+
+# Use the ANOVA + patient-level data
+anova_data <- read.csv("run2/ANOVA_summary_with_patients.csv")
+
+# Filter only significant features
+signif_data <- anova_data %>%
+  filter(p.value < 0.05)
+
+
+# Assume signif_data has: patient_id | timepoint | feature | value
+
+# Aggregate duplicates if needed
+heat_df <- signif_data %>%
+  group_by(feature, patient_id, timepoint) %>%
+  summarise(value = mean(value, na.rm = TRUE), .groups = "drop") %>%
+  unite("row_id", feature, timepoint, sep = "_") %>%  # unique row names
+  pivot_wider(names_from = patient_id, values_from = value)
+
+# Convert to numeric matrix
+heat_mat <- heat_df %>%
+  tibble::column_to_rownames("row_id") %>%
+  as.matrix()
+
+# ---- Plot heatmap ----
+pheatmap(
+  heat_mat,
+  cluster_rows = TRUE,
+  cluster_cols = TRUE,
+  color = colorRampPalette(c("#2166AC", "white", "#B2182B"))(100),
+  main = "Heatmap of Significant Seahorse Features",
+  fontsize_row = 10,
+  fontsize_col = 10,
+  angle_col = 45
+)
+
+
+
+
+# Aggregate values for significant features
+box_df <- signif_data %>%
+  select(patient_id, timepoint, treatment, feature, value)
+
+ggplot(box_df, aes(x = timepoint, y = value, fill = treatment)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.7) +
+  geom_jitter(aes(color = treatment), width = 0.15, size = 2) +
+  facet_wrap(~feature, scales = "free_y") +
+  scale_fill_manual(values = c("control" = "#1E88E5", "stim" = "#E53935")) +
+  scale_color_manual(values = c("control" = "#1E88E5", "stim" = "#E53935")) +
+  labs(title = "Significant Seahorse Features Across Timepoints",
+       x = "Timepoint", y = "Feature Value") +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    legend.position = "top",
+    strip.text = element_text(face = "bold")
+  )
+
+
+
+```
+
+
+```{r}
+library(ggplot2)
+library(dplyr)
+
+# Use the already filtered significant features data
+box_df <- signif_data %>%
+  select(patient_id, timepoint, treatment, feature, value)
+
+# Create output folder
+dir.create("run2/Seahorse_Boxplots", showWarnings = FALSE)
+
+# Loop over each significant feature
+for (f in unique(box_df$feature)) {
+  
+  plot_df <- box_df %>% filter(feature == f)
+  
+  p <- ggplot(plot_df, aes(x = timepoint, y = value, fill = treatment)) +
+    geom_boxplot(outlier.shape = NA, alpha = 0.7, width = 0.6) +
+    geom_jitter(aes(color = treatment), width = 0.15, size = 2, alpha = 0.8) +
+    scale_fill_manual(values = c("control" = "#1E88E5", "stim" = "#E53935")) +
+    scale_color_manual(values = c("control" = "#1E88E5", "stim" = "#E53935")) +
+    labs(
+      title = paste("Seahorse Feature:", f),
+      subtitle = "Control vs Stim Across Timepoints",
+      x = "Timepoint", y = "Feature Value"
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5, size = 16),
+      plot.subtitle = element_text(hjust = 0.5, size = 12, color = "gray30"),
+      axis.title = element_text(face = "bold"),
+      axis.text = element_text(size = 12),
+      legend.position = "top",
+      legend.title = element_text(face = "bold"),
+      strip.text = element_text(face = "bold")
+    )
+  
+  # Save each plot as PNG
+  ggsave(
+    filename = paste0("run2/Seahorse_Boxplots/", f, "_boxplot.png"),
+    plot = p,
+    width = 8,
+    height = 6,
+    dpi = 300,
+    bg = "white"
+  )
+}
+
+cat("✅ Boxplots saved: one PNG per feature in 'run2/Seahorse_Boxplots/'\n")
+
+```
+
+
+
